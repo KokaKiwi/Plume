@@ -8,15 +8,17 @@ use chrono::{NaiveDateTime, TimeZone, Utc};
 use diesel::{self, RunQueryDsl, QueryDsl, ExpressionMethods, BelongingToDsl};
 use heck::{CamelCase, KebabCase};
 use serde_json;
+use workerpool::{Pool, thunk::*};
 
 use plume_api::posts::PostEndpoint;
 use plume_common::{
     activity_pub::{
+        broadcast,
         Hashtag, Source,
         PUBLIC_VISIBILTY, Id, IntoId,
         inbox::{Deletable, FromActivity}
     },
-    utils::md_to_html
+    utils::md_to_html,
 };
 use {BASE_URL, ap_url, Connection};
 use blogs::Blog;
@@ -26,7 +28,7 @@ use medias::Media;
 use mentions::Mention;
 use post_authors::*;
 use reshares::Reshare;
-use tags::Tag;
+use tags::*;
 use users::User;
 use schema::posts;
 use safe_string::SafeString;
@@ -65,27 +67,34 @@ pub struct NewPost {
     pub cover_id: Option<i32>,
 }
 
-impl<'a> Provider<(&'a Connection, Option<i32>)> for Post {
+type Worker = Pool<ThunkWorker<()>>;
+impl<'a> Provider<(&'a Connection, &'a Worker, Option<i32>)> for Post {
     type Data = PostEndpoint;
 
-    fn get((conn, user_id): &(&'a Connection, Option<i32>), id: i32) -> Result<PostEndpoint, Error> {
-        if let Some(post) = Post::get(conn, id) {
-            if !post.published && !user_id.map(|u| post.is_author(conn, u)).unwrap_or(false) {
+    fn get((conn, _worker, user_id): &(&'a Connection, &'a Worker, Option<i32>), id: i32) -> Result<PostEndpoint, Error> {
+        if let Some(p) = Post::get(conn, id) {
+            if !p.published && !user_id.map(|u| p.is_author(conn, u)).unwrap_or(false) {
                 return Err(Error::Authorization("You are not authorized to access this post yet.".to_string()))
             }
-
             Ok(PostEndpoint {
-                id: Some(post.id),
-                title: Some(post.title.clone()),
-                subtitle: Some(post.subtitle.clone()),
-                content: Some(post.content.get().clone())
+                id: Some(p.id),
+                title: Some(p.title.clone()),
+                subtitle: Some(p.subtitle.clone()),
+                content: Some(p.content.get().clone()),
+                source: Some(p.source.clone()),
+                author: Some(p.get_authors(conn)[0].username.clone()),
+                blog_id: Some(p.blog_id),
+                published: Some(p.published),
+                creation_date: Some(p.creation_date.format("%Y-%m-%d").to_string()),
+                license: Some(p.license.clone()),
+                tags: Some(Tag::for_post(conn, p.id).into_iter().map(|t| t.tag).collect()),
             })
         } else {
             Err(Error::NotFound("Request post was not found".to_string()))
         }
     }
 
-    fn list((conn, user_id): &(&'a Connection, Option<i32>), filter: PostEndpoint) -> Vec<PostEndpoint> {
+    fn list((conn, _worker, user_id): &(&'a Connection, &'a Worker, Option<i32>), filter: PostEndpoint) -> Vec<PostEndpoint> {
         let mut query = posts::table.into_boxed();
         if let Some(title) = filter.title {
             query = query.filter(posts::title.eq(title));
@@ -103,27 +112,110 @@ impl<'a> Provider<(&'a Connection, Option<i32>)> for Post {
                 id: Some(p.id),
                 title: Some(p.title.clone()),
                 subtitle: Some(p.subtitle.clone()),
-                content: Some(p.content.get().clone())
+                content: Some(p.content.get().clone()),
+                source: Some(p.source.clone()),
+                author: Some(p.get_authors(conn)[0].username.clone()),
+                blog_id: Some(p.blog_id),
+                published: Some(p.published),
+                creation_date: Some(p.creation_date.format("%Y-%m-%d").to_string()),
+                license: Some(p.license.clone()),
+                tags: Some(Tag::for_post(conn, p.id).into_iter().map(|t| t.tag).collect()),
             })
             .collect()
         ).unwrap_or(vec![])
     }
 
-    fn create((_conn, _user_id): &(&'a Connection, Option<i32>), _query: PostEndpoint) -> Result<PostEndpoint, Error> {
+    fn update((_conn, _worker, _user_id): &(&'a Connection, &'a Worker, Option<i32>), _id: i32, _new_data: PostEndpoint) -> Result<PostEndpoint, Error> {
         unimplemented!()
     }
 
-    fn update((_conn, _user_id): &(&'a Connection, Option<i32>), _id: i32, _new_data: PostEndpoint) -> Result<PostEndpoint, Error> {
-        unimplemented!()
-    }
-
-    fn delete((conn, user_id): &(&'a Connection, Option<i32>), id: i32) {
+    fn delete((conn, _worker, user_id): &(&'a Connection, &'a Worker, Option<i32>), id: i32) {
         let user_id = user_id.expect("Post as Provider::delete: not authenticated");
         if let Some(post) = Post::get(conn, id) {
             if post.is_author(conn, user_id) {
                 post.delete(conn);
             }
         }
+    }
+
+    fn create(ctx: &(&'a Connection, &'a Worker, Option<i32>), query: PostEndpoint) -> Result<PostEndpoint, Error> {
+        if ctx.2.is_none() {
+            return Err(Error::Authorization("You are not authorized to create new articles.".to_string()));
+        }
+
+        let title = query.title.clone().expect("No title for new post in API");
+        let slug = query.title.unwrap().to_kebab_case();
+
+        let date = query.creation_date
+            .and_then(|d| NaiveDateTime::parse_from_str(d.as_ref(), "%Y-%m-%d").ok());
+
+        let (content, mentions, hashtags) = md_to_html(query.source.clone().unwrap_or(String::new()).clone().as_ref());
+
+        let author = User::get(ctx.0, ctx.2.expect("<Post as Provider>::create: no user_id error"))?;
+        let blog = query.blog_id.unwrap_or_else(|| Blog::find_for_author(ctx.0, author.id)[0].id);
+
+        let post = Post::insert(ctx.0, NewPost {
+            blog_id: blog,
+            slug: slug,
+            title: title,
+            content: SafeString::new(content.as_ref()),
+            published: query.published.unwrap_or(true),
+            license: query.license.unwrap_or(Instance::get_local(ctx.0)
+                .map(|i| i.default_license)
+                .unwrap_or(String::from("CC-BY-SA"))),
+            creation_date: date,
+            ap_url: String::new(),
+            subtitle: query.subtitle.unwrap_or(String::new()),
+            source: query.source.unwrap(),
+            cover_id: None,
+        });
+        post.update_ap_url(ctx.0);
+
+        PostAuthor::insert(ctx.0, NewPostAuthor {
+            author_id: author.id,
+            post_id: post.id
+        });
+
+        if let Some(tags) = query.tags {
+            for tag in tags {
+                Tag::insert(ctx.0, NewTag {
+                    tag: tag,
+                    is_hashtag: false,
+                    post_id: post.id
+                });
+            }
+        }
+        for hashtag in hashtags {
+            Tag::insert(ctx.0, NewTag {
+                tag: hashtag.to_camel_case(),
+                is_hashtag: true,
+                post_id: post.id
+            });
+        }
+
+        if post.published {
+            for m in mentions.into_iter() {
+                Mention::from_activity(&*ctx.0, Mention::build_activity(&*ctx.0, m), post.id, true, true);
+            }
+
+            let act = post.create_activity(&*ctx.0);
+            let dest = User::one_by_instance(&*ctx.0);
+            ctx.1.execute(Thunk::of(move || broadcast(&author, act, dest)));
+        }
+
+        Ok(PostEndpoint {
+            id: Some(post.id),
+            title: Some(post.title.clone()),
+            subtitle: Some(post.subtitle.clone()),
+            content: Some(post.content.get().clone()),
+            source: Some(post.source.clone()),
+            author: Some(post.get_authors(ctx.0)[0].username.clone()),
+            blog_id: Some(post.blog_id),
+            published: Some(post.published),
+            creation_date: Some(post.creation_date.format("%Y-%m-%d").to_string()),
+            license: Some(post.license.clone()),
+            tags: Some(Tag::for_post(ctx.0, post.id).into_iter().map(|t| t.tag).collect()),
+        })
     }
 }
 

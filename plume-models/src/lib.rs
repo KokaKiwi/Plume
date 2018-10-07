@@ -24,6 +24,7 @@ extern crate serde_derive;
 extern crate serde_json;
 extern crate url;
 extern crate webfinger;
+extern crate workerpool;
 
 use std::env;
 

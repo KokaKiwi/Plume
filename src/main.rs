@@ -162,6 +162,7 @@ fn main() {
 
             api::posts::get,
             api::posts::list,
+            api::posts::create,
         ])
         .catch(catchers![
             routes::errors::not_found,
