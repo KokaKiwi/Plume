@@ -12,7 +12,9 @@
             <p>@i18n!(ctx.1, "Authors can manage multiple blogs, each as its own website.")</p>
             <p>@i18n!(ctx.1, "Articles are also visible on other Plume instances, and you can interact with them directly from other platforms like Mastodon.")</p>
         </main>
-        <a href="@uri!(user::new)">@i18n!(ctx.1, "Create your account")</a>
+        @if instance.open_registrations {
+            <a href="@uri!(user::new)">@i18n!(ctx.1, "Create your account")</a>
+        }
     </div>
     <div class="presentation card">
         <h2>@i18n!(ctx.1, "About {0}"; instance.name)</h2>
